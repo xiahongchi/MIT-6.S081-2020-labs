@@ -44,6 +44,20 @@ procinit(void)
   kvminithart();
 }
 
+uint64
+nproc(void)
+{
+  struct proc *p;
+  uint64 num = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if(p->state != UNUSED)
+      num += 1;
+  }
+
+  return num;
+}
+
 // Must be called with interrupts disabled,
 // to prevent race with process being moved
 // to a different CPU.
@@ -294,6 +308,9 @@ fork(void)
   pid = np->pid;
 
   np->state = RUNNABLE;
+
+  //for sys_trace
+  np->mask = p->mask;
 
   release(&np->lock);
 
