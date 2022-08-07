@@ -164,12 +164,14 @@ uint64          kvmpa(uint64);
 void            kvmmap(uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
-void            uvminit(pagetable_t, uchar *, uint);
+void            uvminit(pagetable_t, pagetable_t, uchar *, uint);
 uint64          uvmalloc(pagetable_t, uint64, uint64);
 uint64          uvmdealloc(pagetable_t, uint64, uint64);
+uint64          uvmalloc_kpgtbl(pagetable_t, pagetable_t, uint64, uint64);
+uint64          uvmdealloc_kpgtbl(pagetable_t, pagetable_t, uint64, uint64);
 #ifdef SOL_COW
 #else
-int             uvmcopy(pagetable_t, pagetable_t, uint64);
+int             uvmcopy(pagetable_t, pagetable_t, pagetable_t, uint64);
 #endif
 void            uvmfree(pagetable_t, uint64);
 void            uvmunmap(pagetable_t, uint64, uint64, int);
@@ -184,6 +186,8 @@ int             proc_mapkstack(struct proc *, int, pagetable_t);
 void            proc_freekernpagetable(pagetable_t);
 pagetable_t     get_global_kpgtbl(void);
 pte_t *         walk(pagetable_t , uint64 , int);
+void            proc_freekuser(pagetable_t, uint64);
+void            proc_allockuser(pagetable_t, pagetable_t, uint64);
 
 // plic.c
 void            plicinit(void);

@@ -78,9 +78,11 @@ proc_kern_pagetable(struct proc *p)
   if(mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
     panic("kern_pagetable");
 
+  /*
   // CLINT
   if(mappages(pagetable, CLINT, 0x10000, CLINT, PTE_R | PTE_W) != 0)
     panic("kern_pagetable");
+  */
 
   // PLIC
   if(mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
@@ -98,6 +100,11 @@ proc_kern_pagetable(struct proc *p)
   // the highest virtual address in the kernel.
   if(mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
     panic("kern_pagetable");
+
+  // map the trapframe just below TRAMPOLINE, for trampoline.S.
+  if(mappages(pagetable, TRAPFRAME, PGSIZE, (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+    panic("kern_pagetable");
+  }
 
   return pagetable;
 }
@@ -284,7 +291,7 @@ uvmcreate()
 // for the very first process.
 // sz must be less than a page.
 void
-uvminit(pagetable_t pagetable, uchar *src, uint sz)
+uvminit(pagetable_t pagetable, pagetable_t kpgtbl, uchar *src, uint sz)
 {
   char *mem;
 
@@ -293,6 +300,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
   mem = kalloc();
   memset(mem, 0, PGSIZE);
   mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
+  mappages(kpgtbl, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X);
   memmove(mem, src, sz);
 }
 
@@ -305,6 +313,10 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   uint64 a;
 
   if(newsz < oldsz)
+    return oldsz;
+
+  // PLIC limit
+  if(newsz >= PLIC)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
@@ -324,6 +336,43 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+uint64
+uvmalloc_kpgtbl(pagetable_t pagetable, pagetable_t kpgtbl, uint64 oldsz, uint64 newsz)
+{
+  char *mem;
+  uint64 a;
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  // PLIC limit
+  if(newsz >= PLIC)
+    return oldsz;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    mem = kalloc();
+    if(mem == 0){
+      uvmdealloc_kpgtbl(pagetable, kpgtbl, a, oldsz);
+      return 0;
+    }
+    memset(mem, 0, PGSIZE);
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+      kfree(mem);
+      uvmdealloc_kpgtbl(pagetable, kpgtbl, a, oldsz);
+      return 0;
+    }
+    // map for kpgtbl
+    if(mappages(kpgtbl, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R) != 0){
+      kfree(mem);
+      uvmdealloc(pagetable, a+PGSIZE, a);
+      uvmdealloc_kpgtbl(pagetable, kpgtbl, a, oldsz);
+      return 0;
+    }
+  }
+  return newsz;
+}
+
 // Deallocate user pages to bring the process size from oldsz to
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
@@ -337,6 +386,21 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+  }
+
+  return newsz;
+}
+
+uint64
+uvmdealloc_kpgtbl(pagetable_t pagetable, pagetable_t kpgtbl, uint64 oldsz, uint64 newsz)
+{
+  if(newsz >= oldsz)
+    return oldsz;
+
+  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    uvmunmap(kpgtbl, PGROUNDUP(newsz), npages, 0);
   }
 
   return newsz;
@@ -377,18 +441,44 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 void
 proc_freekernpagetable(pagetable_t pagetable)
 {
-  // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
-    pte_t pte = pagetable[i];
-    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
-      // this PTE points to a lower-level page table.
-      uint64 child = PTE2PA(pte);
-      proc_freekernpagetable((pagetable_t)child);
-      pagetable[i] = 0;
-    } 
-  }
-  kfree((void*)pagetable);
+        pte_t pte = pagetable[i];
+        if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+            uint64 child = PTE2PA(pte);
+            proc_freekernpagetable((pagetable_t)child);
+            pagetable[i] = 0;
+        }
+    }
+    kfree((void*)pagetable);
 }
+
+void proc_freekuser(pagetable_t pagetable, uint64 sz) 
+{
+  if(sz > 0)
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);
+}
+
+void proc_allockuser(pagetable_t pagetable, pagetable_t kpgtbl, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(pagetable, i, 0)) == 0)
+      panic("proc_allockuser: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("proc_allockuser: page not present");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if(mappages(kpgtbl, i, PGSIZE, (uint64)pa, flags & (~PTE_U)) != 0){
+      uvmunmap(kpgtbl, 0, i / PGSIZE, 0);
+      panic("proc_allockuser");
+      return;
+    }
+  }
+}
+
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
@@ -397,7 +487,7 @@ proc_freekernpagetable(pagetable_t pagetable)
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy(pagetable_t old, pagetable_t new, pagetable_t new_kpgtbl, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
@@ -418,11 +508,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       kfree(mem);
       goto err;
     }
+    if(mappages(new_kpgtbl, i, PGSIZE, (uint64)mem, flags & (~PTE_U)) != 0){
+      kfree(mem);
+      uvmunmap(new, i, 1, 1);
+      goto err;
+    }
   }
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
+  uvmunmap(new_kpgtbl, 0, i / PGSIZE, 0);
   return -1;
 }
 
@@ -470,6 +566,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
+  return copyin_new(pagetable, dst, srcva, len);
+  /*
   uint64 n, va0, pa0;
 
   while(len > 0){
@@ -487,6 +585,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     srcva = va0 + PGSIZE;
   }
   return 0;
+  */
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -496,6 +595,8 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
+  return copyinstr_new(pagetable, dst, srcva, max);
+  /*
   uint64 n, va0, pa0;
   int got_null = 0;
 
@@ -530,6 +631,7 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+  */
 }
 
 void 
