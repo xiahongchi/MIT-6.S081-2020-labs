@@ -121,6 +121,16 @@ found:
     return 0;
   }
 
+  p->kernel_pagetable = proc_kern_pagetable(p);
+  if(p->kernel_pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  proc_mapkstack(p, (int)(p - proc), p->kernel_pagetable);
+
+  
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,6 +151,9 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kernel_pagetable)
+    proc_freekernpagetable(p->kernel_pagetable);
+  p->kernel_pagetable = 0;
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -473,8 +486,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        
+        //printf("before process kpgtbl\n");
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
+        //printf("after process kpgtbl\n");
         swtch(&c->context, &p->context);
-
+        w_satp(MAKE_SATP(get_global_kpgtbl()));
+        sfence_vma();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;

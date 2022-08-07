@@ -1,0 +1,3 @@
+page 0 contains non-used page
+page 2 contains ROM boot 
+No
