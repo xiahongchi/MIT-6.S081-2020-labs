@@ -126,6 +126,8 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->passed_ticks = 0;
+  p->ticks = 0;
 
   return p;
 }
@@ -181,6 +183,8 @@ proc_pagetable(struct proc *p)
     uvmfree(pagetable, 0);
     return 0;
   }
+
+  p->trapframe_backup = (struct trapframe*)((uint64)(p->trapframe) + PGSIZE/2);
 
   return pagetable;
 }
