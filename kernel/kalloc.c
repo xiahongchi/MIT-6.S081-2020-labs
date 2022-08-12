@@ -20,13 +20,27 @@ struct run {
 
 struct {
   struct spinlock lock;
-  struct run *freelist;
+  struct run *freelist[NCPU];
+  struct spinlock cpulocks[NCPU];
 } kmem;
+
+char* kmemlknames[NCPU];
+char namefield[NCPU*8];
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++) {
+    namefield[i*8] = 'k';
+    namefield[i*8 + 1] = 'm';
+    namefield[i*8 + 2] = 'e';
+    namefield[i*8 + 3] = 'm';
+    namefield[i*8 + 4] = '1' + i;
+    namefield[i*8 + 5] = '\0';
+    kmemlknames[i] = &namefield[i*8];
+    initlock(&kmem.cpulocks[i], kmemlknames[i]);
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -47,6 +61,7 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int currcpu;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
@@ -56,10 +71,14 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  push_off();
+  currcpu = cpuid();
+  pop_off();
+
+  acquire(&kmem.cpulocks[currcpu]);
+  r->next = kmem.freelist[currcpu];
+  kmem.freelist[currcpu] = r;
+  release(&kmem.cpulocks[currcpu]);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -69,14 +88,33 @@ void *
 kalloc(void)
 {
   struct run *r;
+  int currcpu;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  push_off();
+  currcpu = cpuid();
+  pop_off();
+
+  acquire(&kmem.cpulocks[currcpu]);
+  r = kmem.freelist[currcpu];
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem.freelist[currcpu] = r->next;
+  release(&kmem.cpulocks[currcpu]);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+  else {
+    for(int i = 1; i < NCPU; i++) {
+      currcpu = (currcpu + 1) % NCPU;
+      acquire(&kmem.cpulocks[currcpu]);
+      r = kmem.freelist[currcpu];
+      if(r) {
+        kmem.freelist[currcpu] = r->next;
+        release(&kmem.cpulocks[currcpu]);
+        memset((char*)r, 5, PGSIZE); // fill with junk
+        break;
+      }
+      release(&kmem.cpulocks[currcpu]);
+    }
+  }
   return (void*)r;
 }
