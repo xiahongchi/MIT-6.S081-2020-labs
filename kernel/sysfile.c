@@ -290,7 +290,7 @@ sys_open(void)
   int fd, omode;
   struct file *f;
   struct inode *ip;
-  int n;
+  int n, recurtimes = 0, threshold = 10;
 
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
     return -1;
@@ -317,6 +317,29 @@ sys_open(void)
   }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  
+  while(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW) && recurtimes < threshold){
+    // symlink
+    char target[MAXPATH];
+    if(readi(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    iunlockput(ip);
+    if((ip = namei(target)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+    recurtimes++;
+  }
+
+  if(recurtimes >= threshold){
     iunlockput(ip);
     end_op();
     return -1;
@@ -410,6 +433,54 @@ sys_chdir(void)
   end_op();
   p->cwd = ip;
   return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip, *symip;
+  
+  begin_op();
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+    end_op();
+    return -1;
+  }
+
+  if((ip = namei(target)) == 0){
+    if((ip = create(target, T_FILE, 0, 0)) == 0){ // ip has been created and locked
+      end_op();
+      return -1;
+    }
+    iunlockput(ip);
+  }
+  else{
+    iput(ip);
+  }
+
+  if((symip = namei(path)) == 0){
+    if((symip = create(path, T_SYMLINK, 0, 0)) == 0){ // symip has been created and locked
+      end_op();
+      return -1;
+    }
+  }
+  else{
+    ilock(symip);
+    if(symip->type != T_SYMLINK){
+      itrunc(symip);
+      symip->type = T_SYMLINK;
+    }
+  }
+
+  if(writei(symip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+    end_op();
+    return -1;
+  }
+  iunlockput(symip);
+
+  end_op();
+  return 0;
+
 }
 
 uint64
