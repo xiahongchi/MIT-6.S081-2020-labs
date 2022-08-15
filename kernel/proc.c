@@ -5,6 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "stat.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -298,6 +303,15 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // mmap copy
+  np->mmapnum = p->mmapnum;
+  np->mmapstart = p->mmapstart;
+  
+  for(int i = 0; i < np->mmapnum; i++) {
+    np->vmas[i] = p->vmas[i];
+    filedup(np->vmas[i].f);
+  }
+
   pid = np->pid;
 
   np->state = RUNNABLE;
@@ -343,6 +357,31 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // remove all mmap
+  for(int i = 0; i < p->mmapnum; i++){
+    for(uint64 start = p->vmas[i].addr; start < p->vmas[i].addr + p->vmas[i].length; start += PGSIZE){
+      if(walkaddr(p->pagetable, start)) {
+        if(p->vmas[i].flags & MAP_SHARED) {
+          uint writen = PGSIZE;
+          
+          if(start - p->vmas[i].addr + PGSIZE > p->vmas[i].f->ip->size)
+            writen = p->vmas[i].f->ip->size - (start - p->vmas[i].addr);
+          begin_op();
+          ilock(p->vmas[i].f->ip);
+          if(writei(p->vmas[i].f->ip, 1, start, PGROUNDDOWN(start - p->vmas[i].addr), writen) != writen) {
+            iunlock(p->vmas[i].f->ip);
+            printf("%p %p %p %p\n", start, p->vmas[i].f->ip->size, writen, p->vmas[i].addr);
+            panic("exit: munmap write fault");
+          }
+          iunlock(p->vmas[i].f->ip);
+          end_op();
+        }
+        uvmunmap(p->pagetable, start, 1, 1);
+      }
+    }
+    fileclose(p->vmas[i].f);
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

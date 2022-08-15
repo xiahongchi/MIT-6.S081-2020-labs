@@ -5,6 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "stat.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -68,9 +73,75 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    uint64 scause = r_scause(), stval = r_stval();
+    if(scause == 13 || scause == 15) {
+      int i;
+      for(i = 0; i < p->mmapnum; i++) {
+        
+        if(stval >= p->vmas[i].addr && stval < p->vmas[i].addr + p->vmas[i].length){
+          uint64 mem, flags = 0, readn;
+          struct file *f = p->vmas[i].f;
+          int freed = 0;
+
+          
+          if(scause == 13 && !(p->vmas[i].prot & PROT_READ))
+            goto badlazy;
+          
+          if(scause == 15 && !(p->vmas[i].prot & PROT_WRITE))
+            goto badlazy;
+
+          for(int j = 0; j < p->vmas[i].freetimes; j++){
+            uint64 freeaddr = p->vmas[i].freelist[j].freeaddr, freelength = p->vmas[i].freelist[j].freelength;
+            if(stval >= freeaddr && stval < freeaddr + freelength) {
+              freed = 1;
+              break;
+            }
+          }
+
+          if(freed)
+            goto badlazy;
+          
+          mem = (uint64)kalloc();
+          if(!mem)
+            goto badlazy;
+          
+          memset((void *)mem, 0, PGSIZE);
+          ilock(f->ip);
+          if(!f->readable){
+            iunlock(f->ip);
+            goto badlazy;
+          }
+          readn = PGSIZE;
+          if(PGROUNDDOWN(stval - p->vmas[i].addr) + PGSIZE > f->ip->size) {
+            readn = f->ip->size - PGROUNDDOWN(stval - p->vmas[i].addr);
+          }
+          if(readi(f->ip, 0, mem, PGROUNDDOWN(stval - p->vmas[i].addr), readn) != readn) {
+            iunlock(f->ip);
+            goto badlazy;
+          }
+          iunlock(f->ip);
+
+          if(p->vmas[i].prot & PROT_WRITE)
+            flags |= PTE_W;
+          if(p->vmas[i].prot & PROT_READ)
+            flags |= PTE_R;
+          flags |= PTE_U;
+          if(mappages(p->pagetable, PGROUNDDOWN(stval), PGSIZE, mem, flags) < 0) {
+            goto badlazy;
+          }
+          break;
+        }
+      }
+      if(i == p->mmapnum)
+        goto badlazy;
+    }
+    else {
+      badlazy:
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      p->killed = 1;
+    }
+    
   }
 
   if(p->killed)

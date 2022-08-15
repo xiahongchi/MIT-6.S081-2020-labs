@@ -484,3 +484,109 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr, length, offset;
+  int prot, flags;
+  struct file *f;
+  struct proc *p = myproc();
+
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0 || argint(2, &prot) < 0 ||
+    argint(3, &flags) < 0 || argfd(4, 0, &f) < 0 || argaddr(5, &offset) < 0)
+    return -1;
+  
+  if(addr != 0 || offset != 0 || length <= 0)
+    panic("mmap: parameters");
+  
+  if(p->mmapnum >= 16)
+    panic("too many mmap");
+  
+  if(!(f->writable) && (prot & PROT_WRITE) && (flags & MAP_SHARED)){
+    return -1;
+  }
+    
+  // find addr to map
+  addr = PGROUNDDOWN(p->mmapstart);
+  p->mmapstart = PGROUNDUP(addr + length);
+  p->vmas[p->mmapnum].addr = addr;
+  p->vmas[p->mmapnum].length = PGROUNDUP(length);
+  p->vmas[p->mmapnum].prot = prot;
+  p->vmas[p->mmapnum].flags = flags;
+  p->vmas[p->mmapnum].f = f;
+  p->vmas[p->mmapnum].offset = offset;
+  p->vmas[p->mmapnum].freetimes = 0;
+  filedup(f);
+  p->mmapnum++;
+
+  return addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, length;
+  struct proc *p = myproc();
+  int i, j, currmapn = p->mmapnum;
+  
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0)
+    return -1;
+  
+  if(length <= 0)
+    return -1;
+  
+  length = PGROUNDUP(addr + length) - PGROUNDDOWN(addr);
+  addr = PGROUNDDOWN(addr);
+  for(i = 0; i < currmapn; i++) {
+    if(addr >= p->vmas[i].addr && addr + length <= p->vmas[i].addr + p->vmas[i].length) {
+      uint64 freetot = 0;
+      if(p->vmas[i].freetimes == 16)
+        panic("too many free times");
+      for(j = 0; j < p->vmas[i].freetimes; j++){
+        uint64 freeaddr = p->vmas[i].freelist[j].freeaddr, freelength = p->vmas[i].freelist[j].freelength;
+        if(!(freeaddr >= addr + length || freeaddr + freelength <= addr)) {
+          panic("munmap: unmap unmapped areas");
+        }
+        freetot += freelength;
+      }
+
+      p->vmas[i].freelist[p->vmas[i].freetimes].freeaddr = addr;
+      p->vmas[i].freelist[p->vmas[i].freetimes].freelength = length;
+      p->vmas[i].freetimes++;
+
+      for(uint64 start = addr; start <= addr + length; start += PGSIZE) {
+        if(walkaddr(p->pagetable, start)) {
+          if(p->vmas[i].flags & MAP_SHARED) {
+            uint writen = PGSIZE;
+            
+            if(start - p->vmas[i].addr + PGSIZE > p->vmas[i].f->ip->size)
+              writen = p->vmas[i].f->ip->size - (start - p->vmas[i].addr);
+            begin_op();
+            ilock(p->vmas[i].f->ip);
+            if(writei(p->vmas[i].f->ip, 1, start, PGROUNDDOWN(start - p->vmas[i].addr), writen) != writen) {
+              iunlock(p->vmas[i].f->ip);
+              return -1;
+            }
+            iunlock(p->vmas[i].f->ip);
+            end_op();
+          }
+          uvmunmap(p->pagetable, start, 1, 1);
+        }
+      }
+      freetot += length;
+
+      if(freetot == p->vmas[i].length){
+        fileclose(p->vmas[i].f);
+        for(int k = i + 1; k < currmapn; k++){
+          p->vmas[k - 1] = p->vmas[k];
+        }
+        p->mmapnum--;
+      }
+
+      return 0;
+    }
+  }
+
+  return -1;
+}
